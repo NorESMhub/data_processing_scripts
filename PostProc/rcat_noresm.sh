@@ -46,44 +46,49 @@ DELETE=0
 DRYRUN="no"
 ERRCODE=0
 ERRMSG=""
+KEEP_MONTHLY="no" # Do not concatenate monthly files into yearly files
 MOVEDIR="/scratch/${USER}/SOURCE_FILES_TO_BE_DELETED"
 MOVE=0
 MERGETYPE="yearly" # or "monthly" or "mergeall" or "compressonly"
 declare -i NTHREADS=4
 POSITIONAL=()
-PROGREPORTINT=5000
+PROGREPINT=1000
+USEICEFILENAMES="yes"
 UNITTESTMODE="no"  # Used for unit testing, skip input checking, error checks, and runs
-declare -i VERBOSE=0  # Use --verbose to get more output
+declare -i VERBOSE=0   # Use --verbose to get more output
 
-## Error codes
-SUCCESS=0              # Routine ran without error
-ERR_BADARG=02          # Bad command line argument
-ERR_NCKS_MDATA=03      # Error extracting file metadata with ncks
-ERR_UNSUPPORT_CAL=04   # Unsupported NetCDF calendar type
-ERR_UNSUPPORT_TIME=05  # Unsupported NetCDF time units
-ERR_BAD_YEAR0=06       # Error extracting year0 from calendar
-ERR_BADARG_GT=07       # Bad argument(s) to greater_than
-ERR_BADARG_LT=08       # Bad argument(s) to less_than
-ERR_BAD_DATESTR=09     # Bad date string from ncks
-ERR_BADYEAR=10         # Bad year found in history file
-ERR_MULTYEARS=11       # Multiple years found in history file
-ERR_MULTMONTHS=12      # Multiple months found in history file
-ERR_INTERNAL=13        # Internal error (should not happen)
-ERR_MISSING_FILE=14    # File does not exist
-ERR_UNSUPPORT_MERGE=15 # Unsupported merge type for file
-ERR_BAD_MERGETYPE=16   # Bad (unknown) merge type
-ERR_BAD_COMPTYPE=17    # Unknown component type
-ERR_BAD_TIME=18        # Error extracting time using ncks
-ERR_EXTRACT=19         # Error extracting frame using ncks
-ERR_CPRNC=20           # Error running cprnc
-ERR_NOCOMPRESS=21      # No files to compress
-ERR_NCRCAT=22          # Error running ncrcat
-ERR_COMPARE=23         # Error comparing original and compressed data
-ERR_INTERRUPT=24       # User or system interrupt
+## Error codes. 0 and 1 are reserved for true and false Bash primitives
+SUCCESS=02             # Routine ran without error
+ERR_BADARG=03          # Bad command line argument
+ERR_BADARG_GT=04       # Bad argument(s) to greater_than
+ERR_BADARG_LT=05       # Bad argument(s) to less_than
+ERR_BADYEAR=06         # Bad year found in history file
+ERR_BAD_COMPTYPE=07    # Unknown component type
+ERR_BAD_DATESTR=08     # Bad date string from ncks
+ERR_BAD_MERGETYPE=09   # Bad (unknown) merge type
+ERR_BAD_TIME=10        # Error extracting time using ncks
+ERR_BAD_YEAR0=11       # Error extracting year0 from calendar
+ERR_CHECKSUM=12        # Error creating a checksum
+ERR_COMPARE=13         # Error comparing original and compressed data
+ERR_COPY=14            # Error copying file
+ERR_CPRNC=15           # Error running cprnc
+ERR_EXTRACT=16         # Error extracting frame using ncks
+ERR_INTERNAL=17        # Internal error (should not happen)
+ERR_INTERRUPT=18       # User or system interrupt
+ERR_MISSING_FILE=19    # File does not exist
+ERR_MULTMONTHS=20      # Multiple months found in history file
+ERR_MULTYEARS=21       # Multiple years found in history file
+ERR_NCKS_MDATA=22      # Error extracting file metadata with ncks
+ERR_NCRCAT=23          # Error running ncrcat
+ERR_NOACCESS=24
+ERR_NOCOMPRESS=25      # No files to compress
+ERR_UNSUPPORT_CAL=26   # Unsupported NetCDF calendar type
+ERR_UNSUPPORT_MERGE=27 # Unsupported merge type for file
+ERR_UNSUPPORT_TIME=28  # Unsupported NetCDF time units
 
 ## Keep track of failures
-declare -A fail_report=()
-declare -A job_status=() # Status = created, in compress, compressed, in check, pass, fail
+declare -A fail_count=() # Count of job failures
+declare -A job_status=() # Status = created, in compress, compressed, in check, in copy, copied, pass, fail, ERROR
 declare -A error_reports=()
 ## Have a global logfile that can be of use even in the case of an error exit
 declare logfilename=""
@@ -93,6 +98,11 @@ declare err_lockfilename=""
 declare JOBLID
 ## Only report the job status once
 declare job_report_done="no"
+## Path to NCO tools
+declare ncrcat
+declare ncks
+## Top directory of output
+declare outpath
 
 help() {
     echo -e "${tool}, version ${VERSION}\n"
@@ -103,27 +113,41 @@ help() {
     echo "   -y  --year  --yearly    merge per year (default)"
     echo "   -m  --month --monthly   merge per month"
     echo "   -a  --merge-all         merge all files"
-#    echo "       --compress-only     compress files but do not merge"
+    echo "       --compress-only     compress files but do not merge"
+    echo "       --keep-monthly      do not concatenate monthly files into"
+    echo "                           yearly files"
     echo "   -c  --compress N        compression strength 1-9 (default 2)"
     echo "   -t  --threads N         parallel run (default 4)"
     echo "       --compare <option>  Options are \"Spot\" (spot check),"
     echo "                           \"Full\", or \"None\" (default)"
-    echo "       --verbose           Output and log more information about work in progress"
+    echo "       --verbose           Output and log more information about"
+    echo "                           work in progress"
     echo "       --move              move source files to scratch after merge"
     echo "       --delete            move and delete source files when done"
-    echo "       --dryrun            display the files to be merged but do not perform any actions"
+    echo "       --dryrun            display the files to be merged but do"
+    echo "                           not perform any actions"
+    echo "       --check-ice-files   retrieve dates from the ice history files"
+    echo "                           (slow) instead of trusting the filenames"
     echo "   -v  --version           print the current script version and exit"
     echo "   -h  --help              print this message and exit"
     echo ""
+    echo "To compress multiple components, use --comp <comp> once per component"
     echo "--compare checks the fidelity of the merged file against a selection"
     echo "          (spot) or every (full) source file. It does this by"
     echo "          comparing the frame(s) of a source file with the"
     echo "          corresponding frames of the merged file."
     echo "          Any differences are reported and cause an error exit."
-    echo "-y, --year, --yearly, -m, --month, --monthly, -a, --merge-all"
-#    echo "          , and --compress-only control the concatenation of files."
-    echo "          Choose one option (if multiple options are selected,"
-    echo "          only the last one entered is used)"
+    echo "-y, --year, --yearly, -m, --month, --monthly, -a, --merge-all,"
+    echo "    and --compress-only control the concatenation of files."
+    echo "    Choose one option (if multiple options are selected, only"
+    echo "    the last one entered is used)"
+    echo "Note that --keep-monthly only has an effect if the merge type is"
+    echo "     'year' or 'yearly'"
+    echo "The <output path> argument has the same form as <archive case path>;"
+    echo "    The compressed files are stored in a directory under"
+    echo "    <output path> (e.g., '<output path>/ice/hist' or"
+    echo "    '<output path>/rest/1850-05-01-00000')."
+    echo "Using --verbose more than once increases the amount of output"
     if [ $# -gt 0 ]; then
         exit $1
     else
@@ -141,6 +165,46 @@ qlog() {
     if [ -n "${logfilename}" ]; then
         echo -e "${@}" >> ${logfilename}
     fi
+}
+
+add_error() {
+    # Log an error and set the corresponding job status
+    # $1 is the error code to log
+    # $2 is the job key status to set
+    # $3 is the error message
+    local emsg=""
+    ERRCODE=${!1}
+    if [ "${1}" == "ERR_INTERNAL" ]; then
+        emsg="INTERNAL ERROR ${ERRCODE}: ${3}"
+    else
+        emsg="ERROR ${ERRCODE}: ${3}"
+    fi
+    if [ -n "${2}" ]; then
+        job_status[${2}]="${emsg}"
+        fail_count[${2}]=$((fail_count[${2}] + 1))
+        error_reports[${2}]=${ERRCODE}
+    fi
+    log "${emsg}"
+    if [ -n "${ERRMSG}" ]; then
+        ERRMSG="${ERRMSG}\n${emsg}"
+    else
+        ERRMSG="${emsg}"
+    fi
+    return ${ERRCODE}
+}
+
+add_fatal_error() {
+    # Log a fatal error and set the corresponding job status
+    # $1 is the error code to log
+    # $2 is the job key status to set
+    # $3 is the error message
+    local res
+    add_error ${1} "${2}" "${3}"
+    res=$?
+    if [ -n "${err_lockfilename}" ]; then
+        echo -e "ERROR ${1}: ${3}" >> ${err_lockfilename}
+    fi
+    return ${res}
 }
 
 errlog() {
@@ -162,8 +226,11 @@ fatal_error() {
 }
 
 while [ $# -gt 0 ]; do
-    key="$1"
-    case $key in
+    key="${1}"
+    case ${key} in
+        --check-ice-files)
+            USEICEFILENAMES="no"
+            ;;
         --comp)
             if [ $# -lt 2 ]; then
                 echo "--comp requires a component name argument"
@@ -183,6 +250,9 @@ while [ $# -gt 0 ]; do
             ;;
         -y|--year|--yearly)
             MERGETYPE="yearly"
+            ;;
+        --keep-monthly)
+            KEEP_MONTHLY="yes"
             ;;
         -t|--threads)
             if [ $# -lt 2 ]; then
@@ -217,30 +287,46 @@ while [ $# -gt 0 ]; do
             fi
             shift
             ;;
-        --move)
-            MOVE=1
-            ;;
         --delete)
             MOVE=1
             DELETE=1
             ;;
-        --dryrun)
-            DRYRUN="yes"
+        --move)
+            MOVE=1
+            ;;
+        --no-check-ice-files)
+            USEICEFILENAMES="yes"
+            ;;
+        --no-keep-monthly)
+            KEEP_MONTHLY="yes"
+            ;;
+        --no-delete)
+            DELETE=0
+            ;;
+        --no-move)
+            DELETE=0
+            MOVE=0
             ;;
         -h|--help)
             help
             ;;
-        --unit-test-mode)
-            ## Note, this is not documented (not a user-level switch)
-            UNITTESTMODE="yes"
-            ;;
         --verbose)
             VERBOSE=$((VERBOSE + 1))
-            PROGREPORTINT=$((PROGREPORTINT / 10))
+            PROGREPINT=$((PROGREPINT / 10))
+            if [ ${PROGREPINT} -lt 1 ]; then
+                PROGREPINT=1
+            fi
             ;;
         -v|--version)
             echo "${tool} version ${VERSION}"
             exit 0
+            ;;
+        --dryrun)
+            DRYRUN="yes"
+            ;;
+        --unit-test-mode)
+            ## Note, this is not documented (not a user-level switch)
+            UNITTESTMODE="yes"
             ;;
         -*) # unknown
             echo "ERROR: Unknown argument, '${1}'"
@@ -272,17 +358,17 @@ if [ "${UNITTESTMODE}" == "no" ]; then
     ## (possibly newly created) output directory.
     logmsgs=""
     ncrcat=$(which ncrcat)
+    ncks=$(which ncks)
     # The second positional argument is a location for output and logging
     if [ ! -d "${2}" ]; then
         logmsgs="Creating <output path>, '${2}'"
         mkdir -p ${2}
     fi
     outpath=$(realpath "${2}")
-    if [ -f "${outpath}" ]; then
-        ERRMSG="Output path, \"${outpath}\", is not a writeable directory"
-        errlog "ERROR: ${ERRMSG}"
-        ERRCODE=${ERR_BADARG}
-        exit ${ERRCODE}
+    if [ -f "${outpath}" -o ! -w "${outpath}" ]; then
+        add_fatal_error ERR_BADARG ""                                         \
+                        "Output path, \"${outpath}\", is not a writeable directory"
+        exit $?
     fi
     logfilename="${outpath}/${tool}.${JOBLID}.log"
     err_lockfilename="${outpath}/${tool}.${JOBLID}.error"
@@ -297,10 +383,9 @@ if [ "${UNITTESTMODE}" == "no" ]; then
 
     # The first positional argument is the path to an existing case
     if [ ! -d "${1}" ]; then
-        ERRMSG="<archive case path>, '${1}', does not exist"
-        errlog "ERROR: ${ERRMSG}"
-        ERRCODE=${ERR_BADARG}
-        exit ${ERRCODE}
+        add_fatal_error ERR_BADARG ""                                         \
+                        "<archive case path>, '${1}', does not exist"
+        exit $?
     fi
     casepath=$(realpath "${1}")
     casename=$(basename ${casepath})
@@ -328,9 +413,17 @@ if [ "${UNITTESTMODE}" == "no" ]; then
     elif [ "${MERGETYPE}" == "compressonly" ]; then
         log "Do not merge files, compress only"
     else
-        ERRMSG="Undefined merge type, '${MERGETYPE}'."
-        errlog "ERROR: ${ERRMSG}"
-        ERRCODE=${ERR_BADARG}
+        add_fatal_error ERR_BADARG ""                                         \
+                        "Undefined merge type, '${MERGETYPE}'."
+        exit $?
+    fi
+    if [ "${KEEP_MONTHLY}" == "yes" ]; then
+        if [ "${MERGETYPE}" != "yearly" ]; then
+            KEEP_MONTHLY="no"
+            log "Ignoring --keep-monthly option since merge type is not 'yearly'"
+        else
+            log "Not merging monthly files into yearly files"
+        fi
     fi
     log "Compression: ${COMPRESS}"
     log "Threads: ${NTHREADS}"
@@ -339,12 +432,9 @@ if [ "${UNITTESTMODE}" == "no" ]; then
     if [ ${VERBOSE} -ge 1 ]; then
         log "cprnc = ${cprnc}"
         log "xxhsum = ${xxhsum}"
-        log "ncrcat = $(which ncrcat)"
-        log "ncks = $(which ncks)"
+        log "ncrcat = ${ncrcat}"
+        log "ncks = ${ncks}"
         log "===================="
-    fi
-    if [ ${ERRCODE} -ne ${SUCCESS} ]; then
-        exit ${ERRCODE}
     fi
 fi
 
@@ -365,19 +455,22 @@ report_job_status() {
         return
     fi
     # Report on jobs run and any errors
-    tjobs=${#job_status[@]}
-    if [ ${tjobs} -ne ${job_num} ]; then
-        ERRMSG="Internal error, job mismatch (${tjobs} != ${job_num})"
-        errlog "ERROR ${ERRMSG}"
+    if ! fatal_error; then
+        # Job number is not likely to match in the case of an error
+        tjobs=${#job_status[@]}
+        if [ ${tjobs} -ne ${job_num} ]; then
+            ERRMSG="Internal error, job mismatch (${tjobs} != ${job_num})"
+            errlog "ERROR ${ERRMSG}"
+        fi
     fi
-    nfails=$(echo "${fail_report[@]}" | tr ' ' '+' | bc)
+    nfails=$(echo "${fail_count[@]}" | tr ' ' '+' | bc)
     if fatal_error; then
         log "Job encountered fatal errors"
     elif [ ${nfails} -gt 0 ]; then
         for hfile in ${!job_status[@]}; do
             log "Job status for '${hfile}': ${job_status[${hfile}]}"
-            if [ ${fail_report[${hfile}]} -gt 0 ]; then
-                log "Output file: ${job_num} had ${fail_report[${job_num}]} FAILures"
+            if [ ${fail_count[${hfile}]} -gt 0 ]; then
+                log "Output file: ${job_num} had ${fail_count[${job_num}]} FAILures"
             fi
         done
     elif [ ${nerrs} -eq 0 -a ${res} -eq 0 -a "${UNITTESTMODE}" == "no" ]; then
@@ -389,6 +482,32 @@ report_job_status() {
         done
     fi
     job_report_done="yes"
+}
+
+report_progress() {
+    ## Update a progress bar, only outputs if stdout is a terminal
+    ## $1 is the current counter
+    ## $2 is the total work count
+    ## $3 is the update interval
+    ## $4 is a "pre" update message
+    ## $5 is a "post" update message
+    local -i count=${1}
+    local -i tcnt=${2}
+    local -i rep_int=${3}
+    local premsg=${4}
+    local postmsg=${5}
+    if [ ${count} -eq ${tcnt} ]; then
+        # Log completed progress to log file
+        if [ -t 1 ]; then
+            echo -e "\e[1A\e[K"
+        fi
+        log "${premsg}${count} / ${tcnt}${postmsg}"
+    elif [ -t 1 ]; then
+        # Progess bar only to terminal, not logged
+        if [ $((${count} % rep_int)) -eq 0 -a ${count} -gt 0 ]; then
+            echo -e "\e[1A\e[K${premsg}${count} / ${tcnt}${postmsg}"
+        fi
+    fi
 }
 
 kill_zombie_jobs() {
@@ -433,7 +552,9 @@ __cleanup() {
             log "The tool can be restarted and should continue conversion."
         fi
     fi
-    rm -f ${outpath}/*.tmp
+    if [ -n "$(ls ${outpath}/*.tmp 2> /dev/null)" ]; then
+        rm -r ${outpath}/*.tmp
+    fi
     rm -f ${err_lockfilename}
     report_job_status ${res} ${#job_status[@]}
     if [ ${ERRCODE} -ne 0 ]; then
@@ -484,13 +605,15 @@ convert_time_to_date() {
     # fixed 365 day year calendar.
     local day
     local month
+    local res=${SUCCESS}
     local year
     local ytd
     local tstr=${1}
     local year0=${2}
 
     if [ -n "${3}" -a "${3}" != "365" ]; then
-        echo "ERROR: Calendar type, '${3}', not supported"
+        add_error ERR_UNSUPPORT_CAL "" "ERROR: Calendar type, '${3}', not supported"
+        res=$?
     else
         # Round up fractional days
         tstr=$(echo "(${tstr} + 0.99999) / 1" | bc --quiet)
@@ -514,6 +637,7 @@ convert_time_to_date() {
             echo $(printf "%04d%02d%02d" ${year} ${month} ${day})
         fi
     fi
+    return ${res}
 }
 
 get_file_date_field() {
@@ -530,18 +654,17 @@ get_hist_file_info() {
     local res
 
     if [ ${VERBOSE} -ge 2 ]; then
-      qlog "Calling ncks -H -C -v ${2} -s ${3} ${1}"
+      qlog "Calling ${ncks} -H -C -v ${2} -s ${3} ${1}"
     fi
-    fvals=($(ncks -H -C -v ${2} -s ${3} ${1}))
+    fvals=($(${ncks} -H -C -v ${2} -s ${3} ${1}))
     res=$?
     if [ ${res} -ne 0 ]; then
-        ERRMSG="get_hist_file_info: ERROR ${res} extracting ${2} from test file ${1}"
-        errlog "${ERRMSG}"
-        error_reports[${1}]="${ERRMSG}"
-        ERRCODE=${ERR_NCKS_MDATA}
-        exit ${ERRCODE}
+        add_error ERR_NCKS_MDATA "${1}"                                       \
+                  "get_hist_file_info: ERROR ${res} extracting ${2} from test file ${1}"
+        return $?
     fi
     echo "${#fvals[@]}:$(echo ${fvals[@]} | tr ' ' ':')"
+    return ${SUCCESS}
 }
 
 is_yearly_hist_file() {
@@ -588,19 +711,19 @@ get_date_from_filename() {
 }
 
 get_atm_hist_file_info() {
-    ## Given a path to an CAM history file ($1), return the number of frames and the
-    ## date array values (one for each frame)
+    ## Given a path to an CAM history file ($1), return the number of
+    ## frames and the date array values (one for each frame)
 
     local dates
+    local res=${SUCCESS}
     if is_monthly_hist_file "${1}"; then
         dates="1:$(get_date_from_filename ${1})"
     else
         dates=$(get_hist_file_info "${1}" "date" "%d\n")
-        if [ -n "${ERRMSG}" ]; then
-            exit ${ERRCODE}
-        fi
+        res=$?
     fi
     echo ${dates}
+    return ${res}
 }
 
 get_lnd_hist_file_info() {
@@ -608,15 +731,15 @@ get_lnd_hist_file_info() {
     ## date array values (one for each frame)
 
     local dates
+    local res=${SUCCESS}
     if is_monthly_hist_file "${1}"; then
         dates="1:$(get_date_from_filename ${1})"
     else
         dates=$(get_hist_file_info "${1}" "mcdate" "%d\n")
-        if [ -n "${ERRMSG}" ]; then
-            exit ${ERRCODE}
-        fi
+        res=$?
     fi
     echo ${dates}
+    return ${res}
 }
 
 get_year0_from_time_attrib() {
@@ -625,38 +748,44 @@ get_year0_from_time_attrib() {
     ## Otherwise, throw an error and return an empty string
 
     local attrib
+    local res
     local tstr
     local year0=""  # Year calendar begins
 
     if [ ${VERBOSE} -ge 2 ]; then
-      qlog "Calling ncks --metadata -C -v time ${1}"
+      qlog "Calling ${ncks} --metadata -C -v time ${1}"
     fi
-    attrib="$(ncks --metadata -C -v time ${1})"
+    attrib="$(${ncks} --metadata -C -v time ${1})"
     res=$?
     if [ ${res} -ne 0 ]; then
-        ERRMSG="ERROR ${res} extracting time metadata from test file ${1}"
-        errlog "${ERRMSG}"
-        error_reports[${1}]="${ERRMSG}"
-        ERRCODE=${ERR_BAD_YEAR0}
-        exit ${ERRCODE}
+        add_error ERR_BAD_YEAR0 "${1}"                                        \
+                  "ERROR ${res} extracting time metadata from test file ${1}"
+        res=$?
     fi
-    tstr=$(echo "${attrib}" | grep time:calendar)
-    if [[ ! "${tstr,,}" =~ "noleap" ]]; then
-        ERRMSG="Unsupported time calendar for '${1}', '${tstr}'"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_UNSUPPORT_CAL}
-        exit ${ERRCODE}
+    if [ ${res} -eq 0 ]; then
+        tstr=$(echo "${attrib}" | grep time:calendar)
+        if [[ ! "${tstr,,}" =~ "noleap" ]]; then
+            add_error ERR_UNSUPPORT_CAL "${1}"                                \
+                      "Unsupported time calendar for '${1}', '${tstr}'"
+            res=$?
+        fi
     fi
-    tstr=$(echo "${attrib}" | grep time:units)
-    if [[ ! "${tstr}" =~ days\ since\ ([0-9]{4,})-01-01\ 00:00 ]]; then
-        ERRMSG="Unsupported time units for '${1}', '${tstr}'"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_UNSUPPORT_TIME}
-        exit ${ERRCODE}
-    else
-        year0="${BASH_REMATCH[1]}"
+    if [ ${res} -eq 0 ]; then
+        tstr=$(echo "${attrib}" | grep time:units)
+        if [[ ! "${tstr}" =~ days\ since\ ([0-9]{4,})-01-01\ 00:00 ]]; then
+            add_error ERR_UNSUPPORT_TIME "${1}"                               \
+                      "Unsupported time units for '${1}', '${tstr}'"
+            res=$?
+        else
+            year0="${BASH_REMATCH[1]}"
+        fi
     fi
     echo "${year0}"
+    if [ ${res} -eq 0 ]; then
+        return ${SUCCESS}
+    else
+        return ${res}
+    fi
 }
 
 get_ice_hist_file_info() {
@@ -667,36 +796,47 @@ get_ice_hist_file_info() {
     ##    derive the date from the time.
 
     local times=()
+    local res
     local tind
     local year0  # Year calendar begins
 
-    year0="$(get_year0_from_time_attrib ${1})"
-    if [ -n "${ERRMSG}" ]; then
-        exit ${ERRCODE}
-    fi
-    if [ -n "${year0}" ]; then
-        times=($(echo $(get_hist_file_info "${1}" "time" "%f\n") | tr ':' ' '))
+    if [ "${USEICEFILENAMES}" == "yes" ]; then
+        echo "1:$(get_date_from_filename ${1})"
+    else
+        ## Get the date(s) from the file
+        year0="$(get_year0_from_time_attrib ${1})"
+        res=$?
         if [ -n "${ERRMSG}" ]; then
             exit ${ERRCODE}
         fi
-    fi
-    ## Convert times to dates
-    for tind in $(seq 1 $((${#times[@]} - 1))); do
-        times[${tind}]=$(convert_time_to_date ${times[${tind}]} ${year0})
-        if [ "${times[${tind}]}" == "ERROR" ]; then
-            ERRMSG="${times[${tind}]}"
-            ERRCODE=${ERR_UNSUPPORT_CAL}
-            exit ${ERRCODE}
+        if [ -n "${year0}" ]; then
+            tind="$(get_hist_file_info "${1}" "time" "%f\n")"
+            res=$?
+            if [ ${res} -eq ${SUCCESS} ]; then
+                times=(${tind//:/ })
+            fi # No else, on error, times should be empty
         fi
-    done
-    echo  ${times[@]} | tr ' ' ':'
+        ## Convert times to dates
+        for tind in $(seq 1 $((${#times[@]} - 1))); do
+            times[${tind}]=$(convert_time_to_date ${times[${tind}]} ${year0})
+            res=$?
+            if [ ${res} -ne ${SUCCESS} ]; then
+                add_fatal_error ERR_UNSUPPORT_CAL ""                          \
+                                "get_ice_hist_file_info: unsupported calendar"
+                return ${res}
+            fi
+        done
+        echo $(echo "${times[@]}" | tr ' ' ':')
+    fi
+    return ${res}
 }
 
 get_ocn_hist_file_info() {
-    ## Given a path to BLOM history file ($1), return the number of frames and the
-    ## date array values (one for each frame)
+    ## Given a path to BLOM history file ($1), return the number of frames
+    ## and the date array values (one for each frame)
     ## BLOM has time as "days since yyyy-01-01 00:00:00" attribute
-    ##    and a noleap calendar. Check these attributes and derive the date from the time
+    ##    and a noleap calendar. Check these attributes and derive the
+    ##    date from the time
 
     local dates
     local times=()
@@ -711,62 +851,62 @@ get_ocn_hist_file_info() {
             exit ${ERRCODE}
         fi
         if [ -n "${year0}" ]; then
-            times=($(echo $(get_hist_file_info "${1}" "time" "%f\n") | tr ':' ' '))
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            tind="$(get_hist_file_info "${1}" "time" "%f\n")"
+            res=$?
+            if [ ${res} -eq ${SUCCESS} ]; then
+                times=(${tind//:/ })
+            fi # No else, on error, times should be empty
         fi
         ## Convert times to dates
         for tind in $(seq 1 $((${#times[@]} - 1))); do
             times[${tind}]=$(convert_time_to_date ${times[${tind}]} ${year0})
-            if [ "${times[${tind}]}" == "ERROR" ]; then
-                ERRMSG="${times[${tind}]}"
-                ERRCODE=${ERR_UNSUPPORT_CAL}
-                exit ${ERRCODE}
+            res=$?
+            if [ ${res} -ne ${SUCCESS} ]; then
+                add_fatal_error ERR_UNSUPPORT_CAL ""                          \
+                                "get_ocn_hist_file_info: unsupported calendar"
+                return ${res}
             fi
         done
-        dates="$(echo  ${times[@]} | tr ' ' ':')"
+        dates="$(echo ${times[@]} | tr ' ' ':')"
     fi
     echo ${dates}
+    return ${res}
 }
 
 get_rof_hist_file_info() {
-    ## Given a path to an MOSART history file ($1), return the number of frames and the
-    ## date array values (one for each frame)
+    ## Given a path to an MOSART history file ($1), return the number of
+    ## frames and the date array values (one for each frame)
 
     local dates
+    local res=${SUCCESS}
     if is_yearly_hist_file "${1}"; then
         dates="1:$(get_date_from_filename ${1})"
     elif is_monthly_hist_file "${1}"; then
         dates="1:$(get_date_from_filename ${1})"
     else
         dates=$(get_hist_file_info "${1}" "mcdate" "%d\n")
-        if [ -n "${ERRMSG}" ]; then
-            exit ${ERRCODE}
-        fi
+        res=$?
     fi
     echo "${dates}"
+    return ${res}
 }
 
 greater_than() {
     # Return zero if $1 > $2, one otherwise
     if [ -z "${1}" ]; then
-        ERRMSG="greater_than requires two arguments, was called with none"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_BADARG_GT}
-        exit ${ERRCODE}
+        add_error ERR_BADARG_GT ""                                            \
+                  "greater_than requires two arguments, was called with none"
+        return $?
     elif [ -z "${2}" ]; then
-        ERRMSG="greater_than requires two arguments, was called with '${1}'"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_BADARG_GT}
-        exit ${ERRCODE}
+        add_error ERR_BADARG_GT ""                                            \
+                  "greater_than requires two arguments, was called with '${1}'"
+        return $?
     fi
     bcval="$(echo "${1} > ${2}" | bc --quiet)"
     if [ -z "${bcval}" ]; then
-        ERRMSG="Bad bc call in greater_than: echo \"${1} > ${2}\" | bc --quiet"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_BADARG_GT}
-        exit ${ERRCODE}
+        add_error ERR_BADARG_GT ""                                            \
+                  "Bad bc call in greater_than: echo \"${1} > ${2}\" | bc --quiet"
+        return $?
     fi
     return $((1 - bcval));
 }
@@ -775,22 +915,19 @@ less_than() {
     # Return zero if $1 < $2, one otherwise
     local bcval # Output from bc
     if [ -z "${1}" ]; then
-        ERRMSG="less_than requires two arguments, was called with none"
-        errlog "ERROR: ${ERRMSG}"
-        ERRCODE=${ERR_BADARG_LT}
-        exit ${ERRCODE}
+        add_error ERR_BADARG_LT ""                                            \
+                  "less_than requires two arguments, was called with none"
+        return $?
     elif [ -z "${2}" ]; then
-        ERRMSG="less_than requires two arguments, was called with '${1}'"
-        errlog "ERROR: ${ERRMSG}"
-        ERRCODE=${ERR_BADARG_LT}
-        exit ${ERRCODE}
+        add_error ERR_BADARG_LT ""                                            \
+                  "less_than requires two arguments, was called with '${1}'"
+        return $?
     fi
     bcval="$(echo "${1} < ${2}" | bc --quiet)"
     if [ -z "${bcval}" ]; then
-        ERRMSG="Bad bc call in less_than: echo \"${1} < ${2}\" | bc --quiet"
-        errlog "ERROR: ${ERRMSG}"
-        ERRCODE=${ERR_BADARG_LT}
-        exit ${ERRCODE}
+        add_error ERR_BADARG_LT ""                                            \
+                  "Bad bc call in less_than: echo \"${1} < ${2}\" | bc --quiet"
+        return $?
     fi
     return $((1 - bcval));
 }
@@ -799,6 +936,7 @@ bnds_from_array() {
     ## Return the minimum and maximum values in the input array
     local minval=""
     local maxval=""
+    local res
 
     for frame in $@; do
         if [ -z "${minval}" ]; then
@@ -807,17 +945,19 @@ bnds_from_array() {
         if [ -z "${maxval}" ]; then
             maxval="${frame}"
         fi
-        if less_than ${frame} ${minval}; then
+        less_than ${frame} ${minval}
+        res=$?
+        if [ ${res} -eq 0 ]; then
             minval="${frame}"
-            if [ -n "${ERRMSG}" ]; then
-                return ${ERRCODE}
-            fi
+        elif [ ${res} -gt ${SUCCESS} ]; then
+            return ${res}
         fi
-        if greater_than ${frame} ${minval}; then
+        greater_than ${frame} ${minval}
+        res=$?
+        if [ ${res} -eq 0 ]; then
             maxval="${frame}"
-            if [ -n "${ERRMSG}" ]; then
-                return ${ERRCODE}
-            fi
+        elif [ ${res} -gt ${SUCCESS} ]; then
+            return ${res}
         fi
     done
     echo "${minval},${maxval}"
@@ -826,40 +966,40 @@ bnds_from_array() {
 
 get_year_from_date() {
     ## Given a date string, return the year
+    local res=${SUCCESS}
     if [ ${#1} -lt 8 ]; then
-        ERRMSG="ERROR: get_year_from_date; Bad date string, '${1}'"
-        errlog "${ERRMSG}"
-        error_reports["get_year_from_date_${1}"]="${ERRMSG}"
-        ERRCODE=${ERR_BAD_DATESTR}
-        exit ${ERRCODE}
+        add_error ERR_BAD_DATESTR ""                                          \
+                  "get_year_from_date; Bad date string, '${1}'"
+        res=$?
     else
         echo "${1:0:-4}"
     fi
+    return ${res}
 }
 
 get_month_from_date() {
     ## Given a date string, return the month
+    local res=${SUCCESS}
     if [ ${#1} -lt 8 ]; then
-        ERRMSG="ERROR: get_month_from_date; Bad date string, '${1}'"
-        errlog "${ERRMSG}"
-        error_reports["get_month_from_date_${1}"]="${ERRMSG}"
-        ERRCODE=${ERR_BAD_DATESTR}
-        exit ${ERRCODE}
+        add_error ERR_BAD_DATESTR ""                                          \
+                  "get_month_from_date; Bad date string, '${1}'"
+        res=$?
     else
         echo "${1:${#1}-4:-2}"
     fi
+    return ${res}
 }
 
 get_day_from_date() {
     ## Given a date string, return the day of the month
+    local res=${SUCCESS}
     if [ ${#1} -lt 8 ]; then
-        ERRMSG="ERROR: get_day_from_date; Bad date string, '${1}'"
-        errlog "${ERRMSG}"
-        error_reports["get_day_from_date_${1}"]="${ERRMSG}"
-        ERRCODE=${ERR_BAD_DATESTR}
-        exit ${ERRCODE}
+        add_error ERR_BAD_DATESTR ""                                          \
+                  "get_day_from_date; Bad date string, '${1}'"
+        res=$?
     fi
     echo "${1:${#1}-2}"
+    return ${res}
 }
 
 get_range_year() {
@@ -869,6 +1009,7 @@ get_range_year() {
     ## $1 is the date string, $2 is a filename for an error message
     local datestr
     local file="${2}"
+    local res=${SUCCESS}
     local year=-1
     local tyear
     if [ -z "${file}" ]; then
@@ -876,29 +1017,28 @@ get_range_year() {
     fi
     for datestr in $(echo ${1} | cut -d':' -f2- | tr ':' ' '); do
         tyear="$(get_year_from_date ${datestr})"
-        if [ -n "${ERRMSG}" ]; then
+        res=$?
+        if [ ${res} -ne ${SUCCESS} ]; then
             break
         fi
         if [ ${year} -lt 0 ]; then
             year="${tyear}"
         elif [[ ! "${tyear}" =~ ^[0-9]+$ ]]; then
-            ERRMSG="get_range_year: Invalid year found in ${file}"
+            add_error ERR_BADYEAR "${2}"                                      \
+                      "get_range_year: Invalid year found in ${file}"
+            res=$?
             year="ERROR"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_BADYEAR}
             break
         elif [ "${year}" != "${tyear}" ]; then
-            ERRMSG="get_range_year: Multiple years found in ${file}"
+            add_error ERR_MULTYEARS "${2}"                                    \
+                      "get_range_year: Multiple years found in ${file}"
+            res=$?
             year="ERROR"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_MULTYEARS}
             break
         fi
     done
-    if [ -n "${ERRMSG}" ]; then
-        exit ${ERRCODE}
-    fi
     echo "${year}"
+    return ${res}
 }
 
 get_range_month() {
@@ -909,6 +1049,7 @@ get_range_month() {
     local datestr
     local file="${2}"
     local month=-1
+    local res=${SUCCESS}
     local tmonth
     local year=-1
     local tyear
@@ -917,136 +1058,122 @@ get_range_month() {
     fi
     for datestr in $(echo ${1} | cut -d':' -f2- | tr ':' ' '); do
         tyear="$(get_year_from_date ${datestr})"
-        if [ -n "${ERRMSG}" ]; then
-            exit ${ERRCODE}
+        res=$?
+        if [ ${res} -ne ${SUCCESS} ]; then
+            break
         fi
         tmonth="$(get_month_from_date ${datestr})"
-        if [ -n "${ERRMSG}" ]; then
-            exit ${ERRCODE}
+        res=$?
+        if [ ${res} -ne ${SUCCESS} ]; then
+            break
         fi
         if [ ${year} -lt 0 ]; then
             year="${tyear}"
             if [ ${month} -ge 0 ]; then
-                ERRMSG="get_range_month: Internal error, month = ${month}"
-                month="ERROR"
-                errlog "${ERRMSG}"
-                ERRCODE=${ERR_INTERNAL}
-                exit ${ERRCODE}
+                add_error ERR_INTERNAL "${2}"                                 \
+                          "get_range_month: Internal error, month = ${month}"
+                res=$?
+                break
             else
                 month="${tmonth}"
             fi
         elif [ ${month} -lt 0 ]; then
-            ERRMSG="get_range_month: Internal error, year = ${year}"
-            month="ERROR"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_INTERNAL}
-            exit ${ERRCODE}
+            add_error ERR_INTERNAL "${2}"                                     \
+                      "get_range_month: Internal error, year = ${year}"
+            res=$?
+            break
         elif [[ ! "${tyear}" =~ ^[0-9]+$ ]]; then
-            ERRMSG="get_range_month: Invalid year found in ${file}"
-            year="ERROR"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_INTERNAL}
-            exit ${ERRCODE}
+            add_error ERR_INTERNAL "${2}"                                     \
+                      "get_range_month: Invalid year found in ${file}"
+            res=$?
+            break
         elif [[ ! "${tmonth}" =~ ^[0-9]+$ ]]; then
-            ERRMSG="get_range_month: Invalid month found in ${file}"
-            month="ERROR"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_INTERNAL}
-            exit ${ERRCODE}
+            add_error ERR_INTERNAL "${2}"                                     \
+                      "get_range_month: Invalid month found in ${file}"
+            res=$?
+            break
         elif [ "${year}" != "${tyear}" ]; then
-            ERRMSG="get_range_month: Multiple years found in ${file}"
-            month="ERROR"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_MULTYEARS}
-            exit ${ERRCODE}
+            add_error ERR_INTERNAL "${2}"                                     \
+                      "get_range_month: Multiple years found in ${file}"
+            res=$?
+            break
         elif [ "${month}" != "${tmonth}" ]; then
-            ERRMSG="get_range_month: Multiple months found in ${file}"
-            month="ERROR"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_MULTMONTHS}
-            exit ${ERRCODE}
+            add_error ERR_INTERNAL "${2}"                                     \
+                      "get_range_month: Multiple months found in ${file}"
+            res=$?
+            break
         fi
     done
-    echo "${year}:${month}"
+    if [ ${res} -eq ${SUCCESS} ]; then
+        echo "${year}:${month}"
+    fi
+    return ${res}
 }
 
 get_file_date() {
     ## Given a history file ($1), a component type ($2) and a merge type ($3),
     ## find the applicable date in the file or generate an error.
     ## The function is only valid for the 'yearly' and 'monthly' merge types.
-    ## mergeall merges use all the data in each file.
+    ## mergeall merges return the date of the file as yyyymmdd
+    ## compressonly returns the date / time field of the file
     local hfile="${1}"
     local comp="${2}"
     local merge="${3}"
+    local res=${SUCCESS}
     local tdate=""
     local tdates=""
     if [ ! -f "${hfile}" ]; then
-        ERRMSG="get_file_date: File does not exist, '${hfile}'"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_MISSING_FILE}
-        exit ${ERRCODE}
+        add_error ERR_MISSING_FILE "${hfile}"                                 \
+                  "get_file_date: File does not exist, '${hfile}'"
+        res=$?
     elif [ "${merge}" == "mergeall" ]; then
-        ERRMSG="get_file_date: Unsupported merge type, '${merge}'"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_UNSUPPORT_MERGE}
-        exit ${ERRCODE}
+        tdates="$(echo ${hfile} | cut -d'.' -f4 | cut -d'-' -f1-3 | tr -d '-')"
+    elif [ "${merge}" == "compressonly" ]; then
+        tdates="$(echo ${hfile} | cut -d'.' -f4)"
     elif [ "${merge}" != "yearly" -a "${merge}" != "monthly" ]; then
-        ERRMSG="get_file_date: Unrecognized merge type, '${merge}'"
-        errlog "${ERRMSG}"
-        ERRCODE=${ERR_BAD_MERGETYPE}
-        exit ${ERRCODE}
+        add_error ERR_BAD_MERGETYPE "${hfile}"                                \
+                  "get_file_date: Unrecognized merge type, '${merge}'"
+        res=$?
     else
         if [ "${comp}" == "atm" ]; then
             tdates="$(get_atm_hist_file_info ${hfile})"
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            res=$?
         elif [ "${comp}" == "ice" ]; then
             tdates="$(get_ice_hist_file_info ${hfile})"
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            res=$?
         elif [ "${comp}" == "lnd" ]; then
             tdates="$(get_lnd_hist_file_info ${hfile})"
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            res=$?
         elif [ "${comp}" == "ocn" ]; then
             tdates="$(get_ocn_hist_file_info ${hfile})"
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            res=$?
         elif [ "${comp}" == "rof" ]; then
             tdates="$(get_rof_hist_file_info ${hfile})"
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            res=$?
         else
-            ERRMSG="get_file_date: Unrecognized component type, '${comp}'"
-            errlog "${ERRMSG}"
-            ERRCODE=${ERR_BAD_COMPTYPE}
-            exit ${ERRCODE}
+            add_error ERR_BAD_COMPTYPE "${hfile}"                             \
+                      "get_file_date: Unrecognized component type, '${comp}'"
+            res=$?
         fi
     fi
     if [ -n "${tdates}" ]; then
         if [ "${merge}" == "yearly" ]; then
             tdate="$(get_range_year ${tdates} ${hfile})"
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            res=$?
         elif [ "${merge}" == "monthly" ]; then
             tdate="$(get_range_month ${tdates} ${hfile})"
-            if [ -n "${ERRMSG}" ]; then
-                exit ${ERRCODE}
-            fi
+            res=$?
+        else
+            tdate="${tdates}"
         fi
+        echo "${tdate}"
     fi
-    echo "${tdate}"
+    return ${res}
 }
 
 get_xxhsum_filename() {
-    ## Given a filename or directory ($1), return the name for the xxhsum filename
-    ## to use for compression jobs in that directory.
+    ## Given a filename or directory ($1), return the name for the xxhsum
+    ## filename to use for compression jobs in that directory.
     local cdir=""  # The name of the directory where $1 is located
     local fname="" # The xxhsum filename
     local pdir     # Parent directory name
@@ -1104,10 +1231,11 @@ compare_frames() {
     local check_files              # List of source file indices to check
     local diff_output              # cprnc output to parse
     local diff_title               # First part of filename for cprnc output
+    local emsg                     # Error message temp
     local endmsg                   # File checking message
     local ftimes                   # Array of time (or date) fields from an input file
     local nco_args                 # Inputs for the next NCO call
-    local -i nfail=0               # Number of failed source file checks
+    local -i nfail                 # Number of failed frame checks
     local -i numfiles=${#files[@]} # Number of input files
     local -i num_check_files       # Number of source files to check
     local pass                     # Var used to test cprnc pass / fail
@@ -1121,14 +1249,9 @@ compare_frames() {
     test_filename="${outpath}/test_frame_j${job_num}_$(date +'%Y%m%d%H%M%S').nc"
     if [ -f "${test_filename}" ]; then
         # This should not happen!
-        ERRMSG="Temp filename, '${test_filename}', already exists"
-        log "INTERNAL ERROR: ${ERRMSG}"
-        error_reports[${outfile}]="${ERRMSG}"
-        job_status[${outfile}]="ERROR"
-        nfail=$((nfail + 1))
-        fail_report[${outfile}]=${nfail}
-        ERRCODE=${ERR_INTERNAL}
-        return  ${ERRCODE}
+        add_fatal_error ERR_INTERNAL "${outfile}"                              \
+                        "Temp filename, '${test_filename}', already exists"
+        return  $?
     fi
     if [ "${COMPARE}" == "Spot" ]; then
         num_check_files=$(((${numfiles} + 7) / 10)) # Plus first and last source file
@@ -1161,43 +1284,28 @@ compare_frames() {
         ## Find the source filename for this check
         sfile=${files[${check_file}-1]}
         if [ -z "${sfile}" ]; then
-            ERRMSG="empty entry in compare_frames (\${files[${check_file}-1]})"
-            log "INTERNAL ERROR: ${ERRMSG}"
+            emsg="empty entry in compare_frames (\${files[${check_file}-1]})"
             log "INTERNAL ERROR: check_files=(${check_files[@]})"
             log "INTERNAL ERROR: files=(${files[@]})"
-            error_reports[${outfile}]="${ERRMSG}"
-            job_status[${outfile}]="ERROR"
-            nfail=$((nfail + 1))
-            fail_report[${outfile}]=${nfail}
-            ERRCODE=${ERR_INTERNAL}
-            return ${ERRCODE}
+            add_fatal_error ERR_INTERNAL "${outfile}" "${emsg}"
+            return $?
         elif [ ! -f "${sfile}" ]; then
-            ERRMSG="file in compare_frames, '${files[${check_file}-1]}', does not exist"
-            log "INTERNAL ERROR: ${ERRMSG}"
-            error_reports[${outfile}]="${ERRMSG}"
-            job_status[${outfile}]="ERROR"
-            nfail=$((nfail + 1))
-            fail_report[${outfile}]=${nfail}
-            ERRCODE=${ERR_INTERNAL}
-            return ${ERRCODE}
+            emsg="file in compare_frames, '${files[${check_file}-1]}', does not exist"
+            add_fatal_error INTERNAL ERROR "${outfile}" "${emsg}"
+            return $?
         fi
         ## Extract the time dimension for this file
         timevar="time"
         nco_args="-s %f: -H -C -v ${timevar} ${sfile}"
         if [ ${VERBOSE} -ge 2 ]; then
-            qlog "Calling ncks ${nco_args}"
+            qlog "Calling ${ncks} ${nco_args}"
         fi
-        ftimes=($(echo $(ncks ${nco_args}) | tr ':' ' '))
+        ftimes=($(echo $(${ncks} ${nco_args}) | tr ':' ' '))
         res=$?
         if [ ${res} -ne 0 ]; then
-            ERRMSG="${res} extracting time from test file ${check_file}"
-            errlog "ERROR: ${ERRMSG}"
-            error_reports[${outfile}]="${ERRMSG}"
-            job_status[${outfile}]="ERROR"
-            nfail=$((nfail + 1))
-            fail_report[${outfile}]=${nfail}
-            ERRCODE=${ERR_BAD_TIME}
-            return ${ERRCODE}
+            emsg="${res} extracting time from test file ${check_file}"
+            add_error ERR_BAD_TIME "${outfile}" "${emsg}"
+            return $?
         fi
         if [ ${#ftimes[@]} -gt 1 ]; then
             pl="s"
@@ -1212,35 +1320,24 @@ compare_frames() {
         bnds_str="$(bnds_from_array ${ftimes[@]}),1"
         res=$?
         if [ ${res} -ne ${SUCCESS} ]; then
-            ERRMSG="${bnds_str}"
-            ERRCODE=${res}
-            log "ERROR ${res}: ${ERRMSG}"
-            error_reports[${outfile}]="${ERRMSG}"
-            job_status[${outfile}]="ERROR ${res}: ${ERRMSG}"
-            nfail=$((nfail + 1))
-            fail_report[${outfile}]=${nfail}
-            return ${ERRCODE}
+            add_error ${res} "${outfile}" "bad frame bounds from '${ftimes[@]}'"
+            return $?
         fi
         nco_args="-d ${timevar},${bnds_str} ${outfile} ${test_filename}"
         if [ "${DRYRUN}" == "yes" ]; then
-            log "ncks ${nco_args}"
+            log "Calling: ${ncks} ${nco_args}"
         else
             if [ ${VERBOSE} -ge 2 ]; then
-                qlog "Calling ncks ${nco_args}"
+                qlog "Calling ${ncks} ${nco_args}"
             fi
-            ncks ${nco_args}
+            ${ncks} ${nco_args}
             res=$?
             if [ ${res} -ne 0 ]; then
-                ERRMSG="${res} extracting test frame${pl} from output file"
-                errlog "ERROR: ${ERRMSG}"
-                job_status[${outfile}]="ERROR"
-                error_reports[${outfile}]="${ERRMSG}"
-                nfail=$((nfail + 1))
-                fail_report[${outfile}]=${nfail}
-                ERRCODE=${ERR_EXTRACT}
                 ## Cleanup
                 rm -f ${test_filename}
-                return ${ERRCODE}
+                add_error ERR_EXTRACT "${outfile}"                            \
+                          "${res} extracting test frame${pl} from output file"
+                return $?
             fi
         fi
         ## Run cprnc to test output frame against input file
@@ -1258,16 +1355,11 @@ compare_frames() {
             ${cprnc} ${sfile} ${test_filename} > ${diff_output}
             res=$?
             if [ ${res} -ne 0 ]; then
-                ERRMSG="${res} running cprnc to verify output frame${pl} from file, ${sfile}"
-                errlog "ERROR: ${ERRMSG}"
-                job_status[${outfile}]="ERROR"
-                nfail=$((nfail + 1))
-                fail_report[${outfile}]=${nfail}
-                error_reports[${outfile}]="${ERRMSG}"
-                ERRCODE=${ERR_CPRNC}
                 ## Cleanup
                 rm -f ${test_filename}
-                return ${ERRCODE}
+                add_error ERR_CPRNC "${outfile}"                              \
+                          "${res} running cprnc to verify output frame${pl} from file, ${sfile}"
+                return $?
             fi
             grep 'diff_test' ${diff_output} | grep --quiet IDENTICAL
             pass=$?
@@ -1275,13 +1367,11 @@ compare_frames() {
                 log "Checking ${sfile} against output frame${pl} . . . PASS"
             else
                 # Log the comparison failure but do not return an error
-                ERRMSG="Checking ${sfile} against output frame${pl} . . . FAIL"
-                errlog "${ERRMSG}"
-                log "cprnc output saved in ${diff_output}"
-                error_reports[${outfile}]="${ERRMSG}"
-                job_status[${outfile}]="ERROR"
                 nfail=$((nfail + 1))
-                fail_report[${outfile}]=${nfail}
+                add_error ERR_COMPARE "${outfile}"                            \
+                          "Checking ${sfile} against output frame${pl} . . . FAIL"
+                res=$?
+                log "cprnc output saved in ${diff_output}"
             fi
         fi
         ## Cleanup
@@ -1295,9 +1385,91 @@ compare_frames() {
     else
       job_status[${outfile}]="pass"
     fi
-    fail_report[${outfile}]=${nfail}
+    fail_count[${outfile}]=${nfail}
     log "${endmsg}${passmsg}"
     return ${res}
+}
+
+create_checksum() {
+    # Checksum an input file and add it to the correct checksum log file
+    # $1 is the file to be checksummed
+    # Return SUCCESS on success, otherwise, return an error code
+    local checkfile="${1}"
+    local res
+    local xxhsumfile
+
+    if [ "${DRYRUN}" == "yes" ]; then
+        log "${xxhsum} -H2 ${outfile} >> \${xxhsumfile}"
+    else
+        xxhsumfile=$(get_xxhsum_filename ${checkfile})
+        res=$?
+        if [ ${res} -ne ${SUCCESS} ]; then
+            # Need to define error message and code since func was called in subshell
+            add_error ERR_INTERNAL "${checkfile}" "${xxhsumfile}"
+            res=$?
+        else
+            ${xxhsum} -H2 ${checkfile} >> ${xxhsumfile}
+            res=$?
+            if [ ${res} -ne 0 ]; then
+                add_error ERR_INTERNAL "${checkfile}"                         \
+                          "ERROR ${res} running xxhsum on ${checkfile}"
+                res=$?
+            fi
+        fi
+    fi
+    return ${res}
+}
+
+copy_or_compress_file() {
+   # Compress $1 if it is a NetCDF file, otherwise just copy it.
+   # $1 is the file to copy or compress
+   # $2 is the destination directory.
+   # Return SUCCESS if the operation is successful, otherwise, return an error
+   local hfile="${1}"
+   local outdir="${2}"
+   local outfile="${outdir}/${hfile}"
+   local -i res=0
+   if [ "${hfile: -3}" != ".nc" ]; then
+      if [ "${DRYRUN}" == "yes" ]; then
+         log "Dryrun, copy '${hfile}' to '${outdir}'"
+      else
+         job_status[${outfile}]="in copy"
+         if [ ${VERBOSE} -ge 1 ]; then
+            qlog "Copying '${hfile}' to '${outdir}'"
+         fi
+         cp ${hfile} ${outfile}
+         res=$?
+      fi
+      if [ ${res} -eq 0 ]; then
+         job_status[${outfile}]="copied"
+      else
+          add_error ERR_COPY "${outfile}" "Copying '${hfile}' to '${outdir}', res = ${res}"
+         return $?
+      fi
+   else
+      if [ "${DRYRUN}" == "yes" ]; then
+        log "${ncrcat} -O -4 -L ${COMPRESS} ${hfile} -o ${outfile}"
+    else
+        if [ ${VERBOSE} -ge 2 ]; then
+            qlog "Calling: ${ncrcat} -O -4 -L ${COMPRESS} ${hfile} -o ${outfile}"
+        fi
+        ${ncrcat} -O -4 -L ${COMPRESS} ${hfile} -o ${outfile}
+        res=$?
+        if [ ${res} -ne 0 ]; then
+            add_error ERR_NCRCAT "${outfile}" "Error ${res} compressing ${hfile}"
+            return $?
+        fi
+      fi
+   fi
+   if [ ${res} -eq 0 ]; then
+      create_checksum ${outfile}
+      res=$?
+   fi
+   if [ ${res} -eq 0 ]; then
+      return ${SUCCESS}
+   else
+      return ${res}
+   fi
 }
 
 convert_cmd() {
@@ -1316,7 +1488,6 @@ convert_cmd() {
     local res
     local retcode=${SUCCESS}
     local vmsg
-    local xxhsumfile
 
     if [ ${VERBOSE} -ge 1 ]; then
         vmsg="Concatenating ${#files[@]} to ${outfile} using level ${COMPRESS} compression"
@@ -1331,7 +1502,7 @@ convert_cmd() {
         ERRCODE=${ERR_NOCOMPRESS}
         retcode=${ERRCODE}
         job_status[${outfile}]="ERROR"
-        fail_report[${outfile}]=${ERRCODE}
+        fail_count[${outfile}]=${ERRCODE}
     elif [ "${DRYRUN}" == "yes" ]; then
         log "${ncrcat} -O -4 -L ${COMPRESS} ${files[@]} -o ${outfile}"
     else
@@ -1347,40 +1518,17 @@ convert_cmd() {
             ERRCODE=${ERR_NCRCAT}
             retcode=${ERRCODE}
             job_status[${outfile}]="ERROR"
-            fail_report[${outfile}]=${ERRCODE}
+            fail_count[${outfile}]=${ERRCODE}
         fi
     fi
     if [ ${retcode} -eq ${SUCCESS} ]; then
         job_status[${outfile}]="compressed"
-        fail_report[${outfile}]=${SUCCESS}
+        fail_count[${outfile}]=${SUCCESS}
     fi
     if [ ${retcode} -eq ${SUCCESS} ]; then
-        xxhsumfile=$(get_xxhsum_filename ${outfile})
-        res=$?
-        if [ ${res} -ne ${SUCCESS} ]; then
-            # Need to define error message and code since func was called in subshell
-            ERRMSG="${xxhsumfile}"
-            ERRCODE=${ERR_INTERNAL}
-            retcode=${ERRCODE}
-            xxhsumfile=""
-            job_status[${outfile}]="ERROR"
-            fail_report[${outfile}]=${ERRCODE}
-        elif [ "${DRYRUN}" == "yes" ]; then
-            log "${xxhsum} -H2 ${outfile} >> ${xxhsumfile}"
-        else
-            touch -r $reffile ${outfile}
-            ${xxhsum} -H2 ${outfile} >> ${xxhsumfile}
-            res=$?
-            if [ ${res} -ne ${SUCCESS} ]; then
-                ERRMSG="ERROR ${res} running xxhsum on ${outfile}"
-                errlog "${ERRMSG}"
-                error_reports[${outfile}]="${ERRMSG}"
-                ERRCODE=${ERR_INTERNAL}
-                retcode=${ERRCODE}
-                job_status[${outfile}]="ERROR"
-                fail_report[${outfile}]=${ERRCODE}
-            fi
-        fi
+        touch -r ${reffile} ${outfile}
+        create_checksum "${outfile}"
+        retcode=$?
         if [ ${numfiles} -eq 1 ]; then
             nfil="file"
         else
@@ -1400,7 +1548,7 @@ convert_cmd() {
             ERRCODE=${ERR_COMPARE}
             retcode=${ERRCODE}
             job_status[${outfile}]="ERROR"
-            fail_report[${outfile}]=${ERRCODE}
+            fail_count[${outfile}]=${ERRCODE}
         elif [ ${MOVE} -eq 1 ]; then
             if [ "${DRYRUN}" == "yes" ]; then
                 log "Not moving source files (DRYRUN)"
@@ -1415,214 +1563,246 @@ convert_cmd() {
 convert_loop() {
     # Loop through components and concatenate its history files
     # Takes a single argument, a log file for echoing output
-    local cname               # Loop index
-    local comp                # Current component name (e.g., atm, ice)
-    local comparr             # Temp array
-    local compnames           # Array with the set of model(_<inst>) instances to process
+    local atemp          # Temp variable
+    local cname          # Loop index
+    local comp           # Current component name (e.g., atm, ice)
+    local comparr        # Temp array
+    local comppath       # Path to component files to compress
     local currdir="$(pwd -P)"
-    local -i nexttime         # Keep track of the next time to display waiting message
-    local -A dates            # Array keyed by date (year or year:month) with a list of files to process
-    local hpatt               # Component type dependent file matching
-    local file_list           # The current list of files to compress
-    local hfile               # Loop index
-    local hist_files=()       # List of all history files found
-    local -i job_num=0        # Current compression job
-    local mod                 # The name of the model (e.g., cam, cice)
-    local msg                 # For constructing log messages
-    local multiout="no"       # Create output directory for each component
-    local -i  nfails=0        # Figure out if any job has failed.
-    local -i nfileproc=0      # Number of files cataloged so far
-    local -i njobs            # Current number of running jobs
-    local outfile             # Filename for compressed output file
-    local outdir              # Location of compressed files
-    local retcode
-    local setname             # Temp variable to hold a file set name
-    local tdate               # Temporary date field
-    local termstr=""          # Special output only for terminal
+    local -A dates       # Array keyed by date (year or year:month) with a list of files to process
+    local fdate          # The date field of a file
+    local file_list      # The current list of files to compress
+    local hfile          # Loop index
+    local hist_files=()  # List of all history files found
+    local hpatt          # Component type dependent file matching
+    local -i job_num=0   # Current compression job
+    local -i maxdate     # Temp date variable
+    local -i mindate     # Temp date variable
+    local mod            # The name of the model (e.g., cam, cice)
+    local msg            # For constructing log messages
+    local -i nexttime    # Keep track of the next time to display waiting message
+    local -i nfails=0    # Figure out if any job has failed.
+    local -i nfileproc=0 # Number of files cataloged so far
+    local -i nhfiles     # Number of history files to process
+    local -i njobs       # Current number of running jobs
+    local outfile        # Filename for compressed output file
+    local outdir         # Location of compressed files
+    local retcode        # Return code from previous call
+    local rdir           # Loop variable
+    local vtemp          # Temp variable
+    local tdate          # File date field part of file list key
     if  [ ${#COMPONENTS[@]} -eq 0 ]; then
         COMPONENTS+=("ice:cice")
-    elif [ ${#COMPONENTS[@]} -gt 1 ]; then
-      multiout="yes"
-    fi
-    if [ -t 1 ]; then
-        termstr='\e[1A\e[K'
     fi
     for component in ${COMPONENTS[@]}; do
         comparr=(${component//:/ })
         comp=${comparr[0]}
         mod=${comparr[1]}
-        case $comp in
-        atm) hpatt="h[0-9]\{1,2\}";;
+        if [ -z "${mod}" -a "${comp}" == "rest" ]; then
+            mod="${comp}"
+        fi
+        if [ "${comp}" == "rest" ]; then
+            outdir="${outpath}/${comp}"
+            comppath="${casepath}/${comp}"
+        else
+            outdir="${outpath}/${comp}/hist"
+            comppath="${casepath}/${comp}/hist"
+        fi
+        if [ ! -d "${outdir}" ]; then
+            mkdir -p "${outdir}"
+        fi
+        case ${comp} in
+        atm) hpatt="[.]h[0-9]\{1,2\}";;
         lnd) hpatt="[.]h[0-9]\{1,2\}";;
         ice) hpatt="[.]h[0-9]\{0,2\}";;
         ocn) hpatt="[.]h[a-z]\{1,4\}";;
         rof) hpatt="[.]h[0-9]\{1,2\}";;
+        rest) hpatt=".*";;
+        default)
+            add_fatal_error ERR_INTERNAL "" "Unknown component, '${comp}'"
+            ;;
         esac
-        if [ ! -d "${casepath}/${comp}/hist" ]; then
-            log "WARNING: case path, '${casepath}/${comp}/hist', not found, skipping"
+        if [ ! -d "${comppath}" ]; then
+            log "WARNING: case path, '${comppath}', not found, skipping"
             continue
         fi
-        cd ${casepath}/${comp}/hist
+        cd ${comppath}
+        res=$?
+        if [ ${res} -ne 0 ]; then
+            add_error ERR_NOACCESS ""                                        \
+                      "Cannot access case directory, '${comppath}'"
+            continue
+        fi
         log "--------------------"
-        hist_files=($(ls | grep -e "${casename}[.]${mod}.*${hpatt}.*[.]nc$"))
-        log "${comp} hist files: ${#hist_files[@]}"
-        comparr=$(get_file_set_names ${hist_files[@]})
-        compnames=(${comparr//:/ })
-        if [ "${MERGETYPE}" == "yearly" -o "${MERGETYPE}" == "monthly" ]; then
-            for cname in ${compnames[@]}; do
-                # Create a dictionary of every matching file. Key is the date field,
-                #  the value is filename.
-                # We assume that all file sets encompass the same dates.
-                # Also, gather all the dates (years or year:month pairs)
-                dates=()
-                log "Cataloging history files for ${comp}\n"
-                for hfile in ${hist_files[@]}; do
-                    nfileproc=$((nfileproc + 1))
-                    if [ $((nfileproc % PROGREPORTINT)) -eq 0 ]; then
-                        # Progess bar only to terminal, not logged
-                        echo -e "${termstr}$((nfileproc - 1)) files cataloged"
-                    fi
-                    if [ "$(get_file_set_name ${hfile})" == "${cname}" ]; then
-                        tdate="$(get_file_date ${hfile} ${comp} ${MERGETYPE})"
-                        if [ -n "${ERRMSG}" ]; then
-                            break
-                        fi
-                        if [ -z "${tdate}" -o -n "$(echo ${tdate} | grep [^0-9:])" ]; then
-                            ERRMSG="convert_loop: Bad date from '${hfile}', '${tdate}'"
-                            ERRCODE=${ERR_BAD_DATESTR}
-                            break
-                        fi
-                        if [ -n "dates[${tdate}]" ]; then
-                            dates["${tdate}"]="${dates[${tdate}]}:${hfile}"
-                        else
-                            dates["${tdate}"]="${hfile}"
-                        fi
-                    fi
-                done
-                if [ -n "${ERRMSG}" ]; then
-                    errlog "${ERRMSG}"
-                    return ${ERRCODE}
+        if [ "${mod}" == "rest" ]; then
+            hist_files=($(ls */*))
+            for rdir in $(ls); do
+                # Create restart directories
+                mkdir ${outdir}/${rdir}
+            done
+        else
+            hist_files=($(ls | grep -e "${casename}[.]${mod}.*${hpatt}.*[.]nc$"))
+        fi
+        nhfiles=${#hist_files[@]}
+        log "${comp} hist files: ${nhfiles}"
+        # Create a dictionary of every matching file. Key is the date field
+        #  plus the type of history file, the value is filename.
+        # We assume that all file sets encompass the same dates.
+        # Also, gather all the dates (years or year:month pairs)
+        dates=()
+        log "Cataloging history files for ${comp}\n"
+        for hfile in ${hist_files[@]}; do
+            if [ "${hfile: -3}" != ".nc" -o "${comp}" == "rest" ]; then
+                # Escape clause for restart directories
+                # Just copy each file that does not appear to be a NetCDF file
+                copy_or_compress_file ${hfile} ${outdir}
+                retcode=$?
+                if [ ${retcode} -ne ${SUCCESS} ]; then
+                    break
                 fi
-                for tdate in ${!dates[@]}; do
-                    ((job_num++))
-                    log "Compressing ${cname} for ${tdate//:/-}"
-                    file_list=(${dates[${tdate}]//:/ })
-                    if [ "${multiout}" == "yes" ]; then
-                        outdir="${outpath}/${comp}/hist"
-                    else
-                        outdir="${outpath}"
+                ((job_num++))
+                nfileproc=$((nfileproc + 1))
+                report_progress ${nfileproc} ${nhfiles} ${PROGREPINT}         \
+                                "" " files cataloged"
+                continue
+            fi
+            cname="$(get_file_set_name ${hfile})"
+            vtemp="${MERGETYPE}"
+            if [ "${KEEP_MONTHLY}" == "yes" ]; then
+                if is_monthly_hist_file "${hfile}"; then
+                    # Override the date to keep monthly file from being concatenated
+                    # Note that this clause should only happen if MERGETYPE==yearly
+                    vtemp="monthly"
+                fi
+            fi
+            fdate="$(get_file_date ${hfile} ${comp} ${vtemp})"
+            retcode=$?
+            if [ ${retcode} -ne ${SUCCESS} ]; then
+                break
+            fi
+            if [ -z "${fdate}" -o -n "$(echo ${fdate} | grep [^0-9:])" ]; then
+                add_error ERR_BAD_DATESTR "${hfile}"                          \
+                          "convert_loop: Bad date from '${hfile}', '${fdate}'"
+                break
+            fi
+            tdate="${cname};${fdate}"
+            if [ "${MERGETYPE}" == "yearly" -o "${MERGETYPE}" == "monthly" ]; then
+                # Add the history file type here (after error check)
+                if [ -n "dates[${tdate}]" ]; then
+                    dates["${tdate}"]="${dates[${tdate}]}:${hfile}"
+                else
+                    dates["${tdate}"]="${hfile}"
+                fi
+            elif [ "${MERGETYPE}" == "mergeall" ]; then
+                # One list for each cname, keep track of oldest and newest dates
+                # tdate is yyyymmdd-YYYYMMDD where:
+                #    yyyymmdd is the oldest file to concatenate
+                #    YYYYMMDD is the newest file to concatenate
+                vtemp=$(echo ${tdate} | cut -d';' -f2) # date string
+                if [ -n "${dates[${cname}]}" ]; then
+                    atemp=(${dates[${cname}]//;/ })
+                    mindate=${atemp[0]}
+                    maxdate=${atemp[1]}
+                    if [ ${vtemp} -lt ${mindate} ]; then
+                        mindate=${vtemp}
                     fi
-                    if [ ! -d "${outdir}" ]; then
-                        mkdir -p "${outdir}"
+                    if [ ${vtemp} -gt ${maxdate} ]; then
+                        maxdate=${vtemp}
                     fi
-                    outfile="${outdir}/${casename}.${cname}.${tdate//:/-}.nc"
-                    msg="$(printf "%4d: Compressing to $(basename ${outfile})\n" ${job_num})"
-                    if [ ${#file_list[@]} -eq 0 ]; then
-                        log "No files to compress for ${outfile}, skipping"
-                        job_status[${outfile}]="skipped (should not happen?)"
-                    elif [ ${NTHREADS} -le 1 ]; then
-                        log "${msg}"
-                        job_status[${outfile}]="created"
-                        convert_cmd ${outfile} ${comp} ${job_num} ${file_list[@]}
-                        retcode=$?
-                        if [ ${retcode} -ne ${SUCCESS} ]; then
-                            exit ${ERRCODE}
-                        fi
-                    else
-                        nexttime=$(($(date +%s)))
-                        while :; do
-                            ## Wait to launch a new conversion until the number of jobs is low enough.
-                            njobs=$(jobs -r | wc -l)
-                            if [ ${njobs} -lt ${NTHREADS} ]; then
-                                if fatal_error; then
-                                    break
-                                fi
-                                log "${msg}"
-                                job_status[${outfile}]="created"
-                                convert_cmd ${outfile} ${comp} ${job_num} ${file_list[@]} &
-                                break
-                            elif [ ${VERBOSE} -ge 2 -a $(($(date +s))) -gt ${nexttime} ]; then
-                                log "Waiting for job thread, currently running ${njobs} / ${NTHREADS}"
-                                nexttime=$(($(date +%s) + 60))
-                            fi
-                            sleep 0.5s
-                        done
+                    dates["${cname}"]="${mindate};${maxdate};${atemp[2]}:${hfile}"
+                else
+                    dates["${cname}"]="${vtemp};${vtemp};${hfile}"
+                fi
+            elif [ "${MERGETYPE}" == "compressonly" ]; then
+                # One file per key. It is an error to have more than one.
+                if [ -n "dates[${tdate}]" ]; then
+                    add_fatal_error ERR_INTERNAL "${hfile}"                   \
+                                    "key clash for '${tdate}'"
+                    retcode=$?
+                    break
+                else
+                    dates["${tdate}"]="${hfile}"
+                fi
+            else
+                # This really should not happen!
+                add_fatal_error ERR_INTERNAL "${hfile}"                       \
+                                "Undefined merge type, '${MERGETYPE}'."
+                retcode=$?
+            fi
+            nfileproc=$((nfileproc + 1))
+            report_progress ${nfileproc} ${nhfiles} ${PROGREPINT} "" " files cataloged"
+            if fatal_error; then
+                break
+            fi
+        done
+        if fatal_error; then
+            return ${retcode}
+        fi
+        for tdate in ${!dates[@]}; do
+            ((job_num++))
+            file_list=(${dates[${tdate}]//:/ })
+            cname="$(echo ${tdate} | cut -d';' -f1)"
+            if [ "${MERGETYPE}" == "compressonly" -o "${comp}" == "rest" ]; then
+                # Note, this has to be first to capture restart files
+                tdate="$(echo ${tdate} | cut -d';' -f2)"
+                tdate="${tdate//:/-}"
+                outfile="${outdir}/${casename}.${cname}.${tdate}.nc"
+            elif [ "${MERGETYPE}" == "yearly" -o "${MERGETYPE}" == "monthly" ]; then
+                tdate="$(echo ${tdate} | cut -d';' -f2)"
+                tdate="${tdate//:/-}"
+                outfile="${outdir}/${casename}.${cname}.${tdate}.nc"
+                log "Compressing ${cname} for ${tdate}"
+            elif [ "${MERGETYPE}" == "mergeall" ]; then
+                # Note that the first file has the date range prepended to it.
+                vtemp=(${file_list[0]//;/ })
+                tdate="${vtemp[0]}-${vtemp[1]}"
+                file_list[0]=${vtemp[2]}
+                outfile="${outdir}/${casename}.${cname}.${tdate}.nc"
+            else
+                # This really should not happen!
+                add_fatal_error ERR_INTERNAL "${hfile}"                       \
+                                "Undefined merge type, '${MERGETYPE}'."
+                retcode=$?
+                break
+            fi
+            msg="$(printf "%4d: Compressing to $(basename ${outfile})\n" ${job_num})"
+            if [ ${#file_list[@]} -eq 0 ]; then
+                log "No files to compress for ${outfile}, skipping"
+                job_status[${outfile}]="skipped (should not happen?)"
+            elif [ ${NTHREADS} -le 1 ]; then
+                log "${msg}"
+                job_status[${outfile}]="created"
+                convert_cmd ${outfile} ${comp} ${job_num} ${file_list[@]}
+                retcode=$?
+                if [ ${retcode} -ne ${SUCCESS} ]; then
+                    exit ${ERRCODE}
+                fi
+            else
+                nexttime=$(($(date +%s)))
+                while :; do
+                    ## Wait to launch a new conversion until the number of jobs is low enough.
+                    njobs=$(jobs -r | wc -l)
+                    if [ ${njobs} -lt ${NTHREADS} ]; then
                         if fatal_error; then
                             break
                         fi
+                        log "${msg}"
+                        job_status[${outfile}]="created"
+                        convert_cmd ${outfile} ${comp} ${job_num} ${file_list[@]} &
+                        break
+                    elif [ ${VERBOSE} -ge 2 -a $(($(date +s))) -gt ${nexttime} ]; then
+                        log "Waiting for job thread, currently running ${njobs} / ${NTHREADS}"
+                        nexttime=$(($(date +%s) + 60))
                     fi
+                    sleep 0.5s
                 done
                 if fatal_error; then
                     break
                 fi
-            done
-            if fatal_error; then
-                break
             fi
-        else
-            # We will merge all files in each member of compnames.
-            for cname in ${compnames[@]}; do
-                ((job_num++))
-                log "Compressing ${cname}"
-                file_list=()
-                for  hfile in ${hist_files[@]}; do
-                    if [[ ${hfile} =~ ${casename}[.]${cname}[.].*[.]nc ]]; then
-                        file_list+=(${hfile})
-                    fi
-                done
-                if [ "${multiout}" == "yes" ]; then
-                    outdir="${outpath}/${comp}/hist"
-                else
-                    outdir="${outpath}"
-                fi
-                if [ ! -d "${outdir}" ]; then
-                    mkdir -p "${outdir}"
-                fi
-                outfile="${outdir}/${casename}.${cname}.nc"
-                msg="$(printf "%4d: Compressing to $(basename ${outfile})\n" ${job_num})"
-                if [ ${#file_list[@]} -eq 0 ]; then
-                    log "No files to compress for ${outfile}, skipping"
-                    job_status[${outfile}]="skipped (should not happen?)"
-                elif [ ${NTHREADS} -le 1 ]; then
-                    log "${msg}"
-                    job_status[${outfile}]="created"
-                    convert_cmd ${outfile} ${comp} ${job_num} ${file_list[@]}
-                    retcode=$?
-                    if [ ${retcode} -ne ${SUCCESS} ]; then
-                        exit ${ERRCODE}
-                    fi
-                else
-                    nexttime=$(($(date +%s)))
-                    while :; do
-                        ## Wait to launch a new conversion until the
-                        ##    number of jobs is low enough.
-                        if fatal_error; then
-                            break
-                        fi
-                        njobs=$(jobs -r | wc -l)
-                        if [ ${njobs} -lt ${NTHREADS} ]; then
-                            nfails=$(echo "${fail_report[@]}" | tr ' ' '+' | bc)
-                            if [ -n "${ERRMSG}" -o ${nfails} -gt 0 ]; then
-                                break
-                            fi
-                            log "${msg}"
-                            job_status[${outfile}]="created"
-                            convert_cmd ${outfile} ${comp} ${job_num} ${file_list[@]} &
-                            break
-                        elif [ ${VERBOSE} -ge 2 -a $(($(date +%s))) -gt ${nexttime} ]; then
-                            log "Waiting for job thread, currently running ${njobs} / ${NTHREADS}"
-                            nexttime=$(($(date +%s) + 60))
-                        fi
-                        sleep 0.5s
-                    done
-                    if fatal_error; then
-                        break
-                    fi
-                fi
-            done
-            if fatal_error; then
-                break
-            fi
+        done
+        if fatal_error; then
+            break
         fi
         cd ${currdir}
     done
